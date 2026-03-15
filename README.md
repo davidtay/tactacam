@@ -30,7 +30,7 @@ stores a point-in-time snapshot of the shipping address in `sales_order_address`
 when the order is placed — this row never changes unless an admin explicitly
 edits the order.
 
-The actual cause is that the ERP connector was written in the **Magento 1 style**,
+The most likely cause is that the ERP connector was written in the **Magento 1 style**,
 loading the customer's live address book rather than the order snapshot:
 
 ```php
@@ -111,7 +111,7 @@ docker compose run --rm deploy \
         --filter OrderPluginTest --testdox
 ```
 
-See `Order/README.md` for full documentation.
+See the **[Tactacam\_Order module README](Order/README.md)** for full documentation.
 
 ---
 
@@ -153,41 +153,220 @@ The native engine has two common gaps with strict 1:1:
 2. **X and Y are the same SKU** (e.g. "buy 2, get the 3rd free"). The rule
    requires explicit separation between the condition set and the action set.
 
-#### Step 3 – Custom implementation for gap 1 (auto-add Y)
+#### Step 3 – How the totals collector works with cart price rules
 
-If Y must be added to the cart automatically a plugin or observer approach is
-needed:
+Understanding this pipeline is essential before adding any custom code, because
+it determines *where* custom logic should and should not live.
+
+`$quote->collectTotals()` is called on every cart page load, mini-cart update,
+and immediately before order placement. Internally it delegates to
+`TotalsCollector::collect($quote)`, which iterates every address on the quote and
+calls each registered **total model** in `sortOrder` sequence as declared in
+`sales.xml`:
 
 ```
-Observer: checkout_cart_product_add_after
-          checkout_cart_update_items_after
+subtotal   → raw item row totals
+discount   → cart price rules  ← rules fire here
+shipping   → carrier rates
+tax        → tax calculation on (subtotal − discount + shipping)
+grand_total → final sum
 ```
 
-The observer:
-1. Reads the current cart to count X quantity.
-2. Calculates the required Y quantity (`floor(qtyX / 1)` for 1:1).
-3. Adds or updates Y in the cart to match.
-4. Marks Y items with a custom quote-item option (`is_free_gift = 1`) so they
-   are locked from manual removal.
-5. A second observer on `sales_quote_remove_item` prevents direct removal of
-   the locked Y item and instead decrements X to keep the ratio honest.
+The `discount` total model (`Magento\SalesRule\Model\Quote\Discount`) drives the
+rule engine:
 
-Pricing is handled by a standard Cart Price Rule (discount Y by 100 %) so that
-revenue reporting, invoice lines, and refunds remain in the native totals
-pipeline.
+1. Calls `Validator::initTotals($items, $address)` to load all active, applicable
+   rules ordered by priority.
+2. Iterates every visible quote item and calls `Validator::process($item)`.
+3. For each matching rule, delegates discount calculation to a rule-type-specific
+   **discount calculator**. For `buy_x_get_y` rules this is
+   `Magento\SalesRule\Model\Rule\Action\Discount\BuyXGetY`, which:
+   - Scans the full item collection for items matching the **Conditions** (X).
+   - For each qualifying X item it identifies Y items via the **Actions** conditions.
+   - Calculates the free-item discount and writes it to `$item->setDiscountAmount()`.
+4. The `grand_total` collector then aggregates all item discounts into the quote
+   address totals.
 
-#### Step 4 – Enforce ratio integrity at order placement
+**Why this matters for the custom implementation:**
 
-A plugin on `\Magento\Quote\Model\QuoteManagement::placeOrder()` (before-plugin)
-re-validates the X:Y ratio one final time before the order is committed, removing
-excess free items silently if the cart was manipulated client-side.
+Because all pricing math — discounts, tax, revenue reporting, and refund amounts —
+flows through this pipeline, the custom code must **only manage cart item
+quantities**. Setting Y's price to zero directly on the item would bypass tax
+calculation and break invoice/credit memo reporting. The Cart Price Rule handles
+the discount; the observer handles the qty.
+
+```
+checkout_cart_product_add_after  →  observer adds/adjusts Y qty
+                                          ↓
+                              $quote->collectTotals()
+                                          ↓
+                       discount total model: BuyXGetY calculator
+                       sets discount_amount on Y items  ← rule does pricing
+                                          ↓
+                              grand_total aggregation
+```
+
+#### Step 4 – Observer: auto-add and adjust Y quantity
+
+Two events cover all entry points where X quantity can change:
+
+- `checkout_cart_product_add_after` — single product add
+- `checkout_cart_update_items_after` — qty update from the cart page
+
+```php
+namespace Tactacam\CartPromotion\Observer;
+
+use Magento\Catalog\Api\ProductRepositoryInterface;
+use Magento\Checkout\Model\Session as CheckoutSession;
+use Magento\Framework\Event\Observer;
+use Magento\Framework\Event\ObserverInterface;
+
+class AutoAddFreeGift implements ObserverInterface
+{
+    // In production, SKUs and the ratio come from a config model or
+    // a custom attribute on the Cart Price Rule, not hardcoded constants.
+    private const SKU_X = 'product-x-sku';
+    private const SKU_Y = 'product-y-sku';
+
+    public function __construct(
+        private readonly CheckoutSession $checkoutSession,
+        private readonly ProductRepositoryInterface $productRepository
+    ) {}
+
+    public function execute(Observer $observer): void
+    {
+        $quote = $this->checkoutSession->getQuote();
+
+        // 1. Count how many X items are currently in the cart.
+        $xQty = 0;
+        foreach ($quote->getAllVisibleItems() as $item) {
+            if ($item->getSku() === self::SKU_X) {
+                $xQty += (int)$item->getQty();
+            }
+        }
+
+        // 2. Find any Y item already managed by this promotion.
+        $yItem = null;
+        foreach ($quote->getAllVisibleItems() as $item) {
+            if ($item->getSku() === self::SKU_Y
+                && $item->getOptionByCode('is_free_gift')
+            ) {
+                $yItem = $item;
+                break;
+            }
+        }
+
+        // 3. If X was removed entirely, remove the free Y too.
+        if ($xQty === 0) {
+            if ($yItem) {
+                $quote->removeItem($yItem->getId());
+            }
+            return;
+        }
+
+        // 4. Strict 1:1 ratio – required Y qty always equals X qty.
+        $requiredYQty = $xQty;
+
+        if ($yItem) {
+            // Update the existing free-gift item to the new qty.
+            $yItem->setQty($requiredYQty);
+        } else {
+            // Auto-add Y and lock it so the customer cannot remove it manually.
+            // Removal is handled by the sales_quote_remove_item observer, which
+            // decrements X by the same amount to keep the ratio honest.
+            $product = $this->productRepository->get(self::SKU_Y);
+            $yItem   = $quote->addProduct($product, $requiredYQty);
+            $yItem->addOption(['code' => 'is_free_gift', 'value' => '1']);
+        }
+
+        // 5. Mark the quote for totals recollection on the next page load.
+        //    The Cart Price Rule in the discount collector will apply the
+        //    100 % discount to the Y items during collectTotals().
+        $quote->setTriggerRecollect(1)->save();
+    }
+}
+```
+
+#### Step 5 – Before-plugin: enforce ratio integrity at order placement
+
+A customer can manipulate the cart between page loads (e.g. via direct POST or
+a browser devtools edit). The before-plugin on `QuoteManagement::placeOrder()`
+re-validates the X:Y ratio as the final gate before the order is written to the
+database.
+
+```php
+namespace Tactacam\CartPromotion\Plugin;
+
+use Magento\Quote\Api\CartRepositoryInterface;
+use Magento\Quote\Model\QuoteManagement;
+
+class EnforceGiftRatio
+{
+    private const SKU_X = 'product-x-sku';
+    private const SKU_Y = 'product-y-sku';
+
+    public function __construct(
+        private readonly CartRepositoryInterface $cartRepository
+    ) {}
+
+    /**
+     * Before placeOrder fires AFTER collectTotals but BEFORE the order rows
+     * are written. If Y qty exceeds X qty (cart manipulation) the excess Y
+     * items are silently trimmed so the order is always placed with a valid
+     * 1:1 ratio.
+     *
+     * Returning the (possibly modified) arguments re-enters the normal
+     * placeOrder flow with no visible disruption to the customer.
+     */
+    public function beforePlaceOrder(
+        QuoteManagement $subject,
+        int $cartId,
+        $paymentMethod = null
+    ): array {
+        $quote = $this->cartRepository->get($cartId);
+
+        $xQty   = 0;
+        $yItems = [];
+
+        foreach ($quote->getAllVisibleItems() as $item) {
+            if ($item->getSku() === self::SKU_X) {
+                $xQty += (int)$item->getQty();
+            }
+            if ($item->getSku() === self::SKU_Y
+                && $item->getOptionByCode('is_free_gift')
+            ) {
+                $yItems[] = $item;
+            }
+        }
+
+        // Walk the free-gift items and cap their total qty at xQty.
+        $allowedYQty = $xQty;
+        foreach ($yItems as $yItem) {
+            $itemQty = (int)$yItem->getQty();
+            if ($allowedYQty <= 0) {
+                $quote->removeItem($yItem->getId());
+            } elseif ($itemQty > $allowedYQty) {
+                $yItem->setQty($allowedYQty);
+                $allowedYQty = 0;
+            } else {
+                $allowedYQty -= $itemQty;
+            }
+        }
+
+        $this->cartRepository->save($quote);
+
+        // Return all original arguments unchanged so placeOrder proceeds normally.
+        return [$cartId, $paymentMethod];
+    }
+}
+```
 
 #### Decision tree
 
 ```
 Does the promotion require auto-adding Y to the cart?
   No  → Native Cart Price Rule (buy_x_get_y, step=1, amount=1, max=0)
-  Yes → Native rule for pricing + observer to manage Y qty in cart
+  Yes → Native rule for pricing  +  observer to manage Y qty  +  before-plugin on placeOrder
 ```
 
 ---

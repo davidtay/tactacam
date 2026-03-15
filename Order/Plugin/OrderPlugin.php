@@ -1,6 +1,7 @@
 <?php
 namespace Tactacam\Order\Plugin;
 
+use Magento\Customer\Model\Customer;
 use Magento\Customer\Model\CustomerFactory;
 use Magento\Sales\Model\Order;
 use Magento\Sales\Api\Data\OrderInterface as OrderDataInterface;
@@ -97,7 +98,13 @@ class OrderPlugin
      */
     public function afterGetData(Order $subject, $result, $key = '', $index = null)
     {
-        if ($key !== 'customer' || $result === null) {
+        // Only act when the 'customer' key returns an actual Customer model.
+        // The admin dashboard (and some ERP connectors) store the customer's
+        // name as a plain string under this same key, e.g.:
+        //   $order->setData('customer', 'David Tay')
+        // A null / string / array result must be passed through untouched;
+        // calling getDefaultShippingAddress() on a non-object would be fatal.
+        if ($key !== 'customer' || !($result instanceof Customer)) {
             return $result;
         }
 

@@ -32,7 +32,7 @@ the order address, and no cron job updates orders after they are sent to the ERP
 
 ## 2. Root cause
 
-The ERP connector was written in the Magento 1 style:
+The ERP connector was likely written in the Magento 1 style:
 
 ```php
 // Bad – loads the customer's live address book, not the order snapshot

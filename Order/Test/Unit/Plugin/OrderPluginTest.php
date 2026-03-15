@@ -172,14 +172,29 @@ class OrderPluginTest extends TestCase
     }
 
     /**
-     * When getData('customer') returns null the customer has not yet been
-     * attached to the order – there is nothing to override.
+     * When getData('customer') returns null the customer object has not yet
+     * been loaded onto the order – nothing to override.
      */
     public function testAfterGetDataPassesThroughForNullCustomer(): void
     {
         $result = $this->plugin->afterGetData($this->orderSubjectMock, null, 'customer');
 
         $this->assertNull($result, 'A null customer must be returned as-is.');
+    }
+
+    /**
+     * The Magento admin dashboard (and some ERP connectors) store the customer
+     * name as a plain string under the 'customer' key, e.g.:
+     *   $order->setData('customer', 'David Tay')
+     *
+     * Calling getDefaultShippingAddress() on a string would be fatal.
+     * The instanceof guard must catch this and return the string unchanged.
+     */
+    public function testAfterGetDataPassesThroughForStringCustomerName(): void
+    {
+        $result = $this->plugin->afterGetData($this->orderSubjectMock, 'David Tay', 'customer');
+
+        $this->assertSame('David Tay', $result, 'A string stored under the customer key must be returned unchanged.');
     }
 
     /**
