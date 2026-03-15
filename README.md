@@ -462,49 +462,100 @@ optimised image files.
 ### Summary
 
 The key insight is that the API response **structure** must stay identical across
-all consumers — the same `base`, `small_image`, and `thumbnail` role names —
-but the actual image files returned must differ by consumer. A convention of
-consumer-prefixed image roles (`mobile_base`, `affiliate_base`, etc.) registered
-in `view.xml` lets merchants assign consumer-specific image variants in the
-standard gallery admin UI with no new attributes or UI widgets. A plugin on
+all consumers — the same `image`, `small_image`, and `thumbnail` role names —
+but the actual image files returned must differ by consumer. The standard roles
+are product EAV attributes with `frontend_input = 'media_image'`; consumer-
+specific variants (`mobile_image`, `affiliate_image`, etc.) are added the same
+way via a setup data patch, which causes them to appear automatically in the
+product admin gallery UI with no custom UI work. A plugin on
 `ProductRepositoryInterface` reads an `X-Consumer-Type` request header, maps it
 to the appropriate role prefix, and rewrites `media_gallery_entries` in place so
 the consuming app always receives standard role names carrying the correct images.
 The web PDP never sends the header and always receives the default gallery
-untouched; new consumer types are added by registering new roles in `view.xml`
-and configuring the mapping, with no further code changes required.
+untouched; new consumer types require only a data patch and one line in the
+plugin's role-prefix map.
 
 ### Approach
 
-The response contract is fixed — `base`, `small_image`, `thumbnail` must always
+The response contract is fixed — `image`, `small_image`, `thumbnail` must always
 be present with those names. What changes per consumer is which image file backs
 each role.
 
-#### Step 1 – Register consumer-specific image roles in `view.xml`
+#### Step 1 – Understand how image roles are defined
 
-For each consumer type that needs its own image set, register a role per
-standard role using a `{consumer}_{role}` naming convention:
+The roles `image`, `small_image`, and `thumbnail` that appear in the product
+admin gallery UI are **product EAV attributes** with `frontend_input =
+'media_image'`, defined in
+`Magento\Catalog\Setup\CategorySetup::getDefaultEntities()`. They are not
+`view.xml` entries.
 
-```xml
-<!-- theme/Magento_Catalog/view.xml -->
+The gallery role dropdown is populated at runtime by
+`Product\Media\Config::getMediaAttributeCodes()` which calls
+`getAttributeCodesByFrontendType('media_image')` — a live database query against
+`eav_attribute`. Any attribute created with `input = 'media_image'` automatically
+appears as an assignable role in the admin UI.
 
-<!-- Web (default) – existing roles, no change needed -->
+`view.xml` image entries (e.g. `product_page_image_large`) are **rendering
+configurations** — they define resize dimensions and display contexts for the
+frontend. They are entirely separate from the role assignment system.
 
-<!-- Mobile app – smaller, compressed images -->
-<image id="mobile_base"        type="image"><width>800</width><height>800</height></image>
-<image id="mobile_small_image" type="image"><width>400</width><height>400</height></image>
-<image id="mobile_thumbnail"   type="image"><width>200</width><height>200</height></image>
+To add consumer-specific roles, create a **setup data patch** that registers new
+`media_image` attributes:
 
-<!-- Affiliate – full resolution with watermark baked in at upload time -->
-<image id="affiliate_base"        type="image"><width>1200</width><height>1200</height></image>
-<image id="affiliate_small_image" type="image"><width>600</width><height>600</height></image>
-<image id="affiliate_thumbnail"   type="image"><width>300</width><height>300</height></image>
+```php
+namespace Tactacam\Catalog\Setup\Patch\Data;
+
+use Magento\Catalog\Model\Product;
+use Magento\Eav\Setup\EavSetupFactory;
+use Magento\Framework\Setup\ModuleDataSetupInterface;
+use Magento\Framework\Setup\Patch\DataPatchInterface;
+
+class AddConsumerImageRoles implements DataPatchInterface
+{
+    public function __construct(
+        private readonly ModuleDataSetupInterface $moduleDataSetup,
+        private readonly EavSetupFactory $eavSetupFactory
+    ) {}
+
+    public function apply(): self
+    {
+        $eavSetup = $this->eavSetupFactory->create(['setup' => $this->moduleDataSetup]);
+
+        $roles = [
+            // Mobile – compressed images optimised for small screens
+            'mobile_image'        => 'Mobile Base Image',
+            'mobile_small_image'  => 'Mobile Small Image',
+            'mobile_thumbnail'    => 'Mobile Thumbnail',
+            // Affiliate – full-resolution images with watermark baked in
+            'affiliate_image'        => 'Affiliate Base Image',
+            'affiliate_small_image'  => 'Affiliate Small Image',
+            'affiliate_thumbnail'    => 'Affiliate Thumbnail',
+        ];
+
+        foreach ($roles as $code => $label) {
+            $eavSetup->addAttribute(Product::ENTITY, $code, [
+                'type'                    => 'varchar',
+                'label'                   => $label,
+                'input'                   => 'media_image',   // ← makes it an assignable role
+                'required'                => false,
+                'sort_order'              => 10,
+                'global'                  => \Magento\Eav\Model\Entity\Attribute\ScopedAttributeInterface::SCOPE_STORE,
+                'used_in_product_listing' => false,
+                'visible'                 => false,
+                'group'                   => 'Images',
+            ]);
+        }
+
+        return $this;
+    }
+
+    public static function getDependencies(): array { return []; }
+    public function getAliases(): array { return []; }
+}
 ```
 
-Registering the roles in `view.xml` adds them to the product admin gallery UI,
-so merchants assign images to them exactly as they would `base` or `thumbnail`.
-Role assignments are stored in `catalog_product_entity_media_gallery_value.types`
-and read at runtime via `$entry->getTypes()`. No new attributes, no new tables.
+After running `bin/magento setup:upgrade`, the new roles appear in the product
+admin gallery UI alongside `image`, `small_image`, and `thumbnail`.
 
 #### Step 2 – Consumer identification via request header
 
@@ -544,7 +595,7 @@ class ConsumerImagePlugin
         'affiliate' => 'affiliate_',
     ];
 
-    private const STANDARD_ROLES = ['base', 'small_image', 'thumbnail'];
+    private const STANDARD_ROLES = ['image', 'small_image', 'thumbnail'];
 
     public function __construct(
         private readonly RequestInterface $request
@@ -612,28 +663,29 @@ class ConsumerImagePlugin
 
 #### Step 4 – Fallback strategy
 
-| Scenario | `base` returned | `small_image` returned | `thumbnail` returned |
+| Scenario | `image` returned | `small_image` returned | `thumbnail` returned |
 |---|---|---|---|
-| No `X-Consumer-Type` header | Standard `base` | Standard `small_image` | Standard `thumbnail` |
-| `X-Consumer-Type: mobile`, all mobile roles assigned | `mobile_base` file | `mobile_small_image` file | `mobile_thumbnail` file |
-| `X-Consumer-Type: mobile`, `mobile_thumbnail` missing | `mobile_base` file | `mobile_small_image` file | Standard `thumbnail` (fallback) |
+| No `X-Consumer-Type` header | Standard `image` | Standard `small_image` | Standard `thumbnail` |
+| `X-Consumer-Type: mobile`, all mobile roles assigned | `mobile_image` file | `mobile_small_image` file | `mobile_thumbnail` file |
+| `X-Consumer-Type: mobile`, `mobile_thumbnail` missing | `mobile_image` file | `mobile_small_image` file | Standard `thumbnail` (fallback) |
 | Storefront PDP | Standard gallery — plugin never fires | | |
 
 #### Step 5 – Merchant workflow
 
 1. Open the product in the admin.
-2. Upload the web-optimised images and assign `base`, `small_image`, `thumbnail`.
-3. Upload mobile-optimised images and assign `mobile_base`, `mobile_small_image`,
+2. Upload the web-optimised images and assign `image`, `small_image`, `thumbnail`.
+3. Upload mobile-optimised images and assign `mobile_image`, `mobile_small_image`,
    `mobile_thumbnail`.
-4. Upload watermarked images and assign `affiliate_base`, `affiliate_small_image`,
+4. Upload watermarked images and assign `affiliate_image`, `affiliate_small_image`,
    `affiliate_thumbnail`.
 5. Any standard role without a consumer-specific counterpart falls back
    automatically — partial assignment is always safe.
 
 #### Step 6 – Adding a new consumer
 
-1. Register `{consumer}_base`, `{consumer}_small_image`, `{consumer}_thumbnail`
-   in `view.xml`.
+1. Add the three `media_image` attributes (`{consumer}_image`,
+   `{consumer}_small_image`, `{consumer}_thumbnail`) to the setup data patch
+   and run `bin/magento setup:upgrade`.
 2. Add the consumer key and prefix to `CONSUMER_ROLE_PREFIX` in the plugin.
 3. No other code changes required. Merchants begin assigning images to the new
    roles immediately.
