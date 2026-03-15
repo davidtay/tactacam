@@ -123,6 +123,21 @@ A promotion where the discount scales strictly in proportion to the quantity
 purchased: buy 1 of X → get 1 of Y free, buy 2 of X → get 2 of Y free, and so
 on. Y must never exceed the quantity of X in the cart.
 
+### Summary
+
+When X and Y are already in the cart, Magento's native `buy_x_get_y` Cart Price 
+Rule handles strict 1:1 with no custom code — `Discount Amount = 1`, 
+`Discount Qty Step = 1`, and `Maximum Qty = 0` scales the discount proportionally 
+with quantity. Where Y must be auto-added, a custom `free_gift_sku` attribute is 
+added to the `salesrule` table so the merchandiser specifies the gift product 
+directly on the rule in the admin, keeping all promotion configuration in one place. 
+An observer on `checkout_cart_product_add_after` reads the rule's Conditions to count 
+X items and auto-adds or adjusts Y accordingly, while the Cart Price Rule continues 
+to own all discount pricing through the native totals collector pipeline. 
+A before-plugin on `QuoteManagement::placeOrder()` acts as a final integrity gate, 
+re-evaluating the same Conditions immediately before the order is written to ensure 
+any client-side cart manipulation cannot result in more free items than purchased items.
+
 ### Approach
 
 #### Step 1 – Evaluate the native engine first
@@ -213,21 +228,15 @@ Two events cover all entry points where X quantity can change:
 - `checkout_cart_product_add_after` — single product add
 - `checkout_cart_update_items_after` — qty update from the cart page
 
-**Why no hardcoded SKUs**
-
-The observer must not know which products are X or Y. That information already
-lives inside the Cart Price Rule:
-
-- **X items** are identified by evaluating the rule's **Conditions** against
-  each quote item — `$rule->getConditions()->validate($item)`. No SKU list is
-  needed; the merchandiser maintains X through the normal rule admin UI.
-- **Y** (the product to auto-add) cannot be derived from the native rule schema
-  alone, because the `buy_x_get_y` calculator applies the discount to items
-  already in the cart rather than specifying a separate gift SKU. A lightweight
-  custom attribute — `free_gift_sku` — is added to the `salesrule` table and
-  exposed in the admin **Actions** tab. The merchandiser types the SKU once; the
-  observer reads it at runtime. This keeps all promotion configuration in one
-  place (the rule) and requires zero code changes to run a different promotion.
+X items are identified by evaluating the rule's **Conditions** against each
+quote item — `$rule->getConditions()->validate($item)` — so the merchandiser
+controls which products qualify as X entirely through the standard rule admin UI.
+Y cannot be derived from the native rule schema alone because the `buy_x_get_y`
+calculator discounts items already in the cart rather than specifying a separate
+gift SKU. A lightweight custom attribute — `free_gift_sku` — is added to the
+`salesrule` table and exposed in the admin **Actions** tab. The merchandiser
+types the SKU once; all promotion configuration stays in one place and no code
+change is needed to run a different promotion.
 
 ```php
 namespace Tactacam\CartPromotion\Observer;
