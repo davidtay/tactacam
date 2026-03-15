@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="urn:magento:framework:ObjectManager/etc/config.xsd">
+    <!--
+        Target the concrete model, NOT the interface.
+        OrderInterface has no getCustomer() declaration, so a plugin on it
+        would never fire. Magento's interceptor generator reads the
+        @method docblock on Order and generates afterGetCustomer here.
+    -->
+    <type name="Magento\Sales\Model\Order">
+        <plugin name="tactacamOrderPlugin" type="Tactacam\Order\Plugin\OrderPlugin"/>
+    </type>
+
+    <type name="Magento\Sales\Api\OrderRepositoryInterface">
+        <plugin name="tactacamOrderRepositoryPlugin" type="Tactacam\Order\Plugin\OrderPlugin"/>
+    </type>
+
+    <!--
+        Register the diagnostic CLI command.
+        Run: bin/magento tactacam:order:diagnose
+    -->
+    <type name="Magento\Framework\Console\CommandList">
+        <arguments>
+            <argument name="commands" xsi:type="array">
+                <item name="tactacamOrderDiagnose" xsi:type="object">Tactacam\Order\Console\Command\DiagnoseOrder</item>
+            </argument>
+        </arguments>
+    </type>
+</config>
