@@ -1,6 +1,5 @@
 # Tactacam – Magento 2 Technical Assessment
 
-**Candidate:** David Tay
 **Date:** March 15, 2026
 **Platform:** Adobe Commerce 2.4.7-p8
 
@@ -486,8 +485,7 @@ each role.
 The roles `image`, `small_image`, and `thumbnail` that appear in the product
 admin gallery UI are **product EAV attributes** with `frontend_input =
 'media_image'`, defined in
-`Magento\Catalog\Setup\CategorySetup::getDefaultEntities()`. They are not
-`view.xml` entries.
+`Magento\Catalog\Setup\CategorySetup::getDefaultEntities()`.
 
 The gallery role dropdown is populated at runtime by
 `Product\Media\Config::getMediaAttributeCodes()` which calls
