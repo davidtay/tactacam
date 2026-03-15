@@ -213,6 +213,22 @@ Two events cover all entry points where X quantity can change:
 - `checkout_cart_product_add_after` — single product add
 - `checkout_cart_update_items_after` — qty update from the cart page
 
+**Why no hardcoded SKUs**
+
+The observer must not know which products are X or Y. That information already
+lives inside the Cart Price Rule:
+
+- **X items** are identified by evaluating the rule's **Conditions** against
+  each quote item — `$rule->getConditions()->validate($item)`. No SKU list is
+  needed; the merchandiser maintains X through the normal rule admin UI.
+- **Y** (the product to auto-add) cannot be derived from the native rule schema
+  alone, because the `buy_x_get_y` calculator applies the discount to items
+  already in the cart rather than specifying a separate gift SKU. A lightweight
+  custom attribute — `free_gift_sku` — is added to the `salesrule` table and
+  exposed in the admin **Actions** tab. The merchandiser types the SKU once; the
+  observer reads it at runtime. This keeps all promotion configuration in one
+  place (the rule) and requires zero code changes to run a different promotion.
+
 ```php
 namespace Tactacam\CartPromotion\Observer;
 
@@ -220,43 +236,73 @@ use Magento\Catalog\Api\ProductRepositoryInterface;
 use Magento\Checkout\Model\Session as CheckoutSession;
 use Magento\Framework\Event\Observer;
 use Magento\Framework\Event\ObserverInterface;
+use Magento\SalesRule\Model\ResourceModel\Rule\CollectionFactory as RuleCollectionFactory;
+use Magento\Store\Model\StoreManagerInterface;
 
 class AutoAddFreeGift implements ObserverInterface
 {
-    // In production, SKUs and the ratio come from a config model or
-    // a custom attribute on the Cart Price Rule, not hardcoded constants.
-    private const SKU_X = 'product-x-sku';
-    private const SKU_Y = 'product-y-sku';
-
     public function __construct(
         private readonly CheckoutSession $checkoutSession,
-        private readonly ProductRepositoryInterface $productRepository
+        private readonly ProductRepositoryInterface $productRepository,
+        private readonly RuleCollectionFactory $ruleCollectionFactory,
+        private readonly StoreManagerInterface $storeManager
     ) {}
 
     public function execute(Observer $observer): void
     {
         $quote = $this->checkoutSession->getQuote();
 
-        // 1. Count how many X items are currently in the cart.
+        // Load every active buy_x_get_y rule that has a free_gift_sku set.
+        // addWebsiteGroupDateFilter scopes to the current website, customer
+        // group, and date range – the same filters the native discount
+        // collector uses, so only rules that would fire in collectTotals()
+        // are considered here.
+        $rules = $this->ruleCollectionFactory->create()
+            ->addWebsiteGroupDateFilter(
+                $this->storeManager->getStore()->getWebsiteId(),
+                $quote->getCustomerGroupId()
+            )
+            ->addFieldToFilter('simple_action', 'buy_x_get_y')
+            ->addFieldToFilter('free_gift_sku', ['notnull' => true])
+            ->setOrder('sort_order', 'ASC');
+
+        foreach ($rules as $rule) {
+            $this->processRule($rule, $quote);
+        }
+
+        $quote->setTriggerRecollect(1)->save();
+    }
+
+    private function processRule(\Magento\SalesRule\Model\Rule $rule, \Magento\Quote\Model\Quote $quote): void
+    {
+        // Count X items: those that satisfy the rule's Conditions tab.
+        // The merchandiser controls which products qualify as X entirely
+        // through the standard rule admin UI – no code change required.
         $xQty = 0;
         foreach ($quote->getAllVisibleItems() as $item) {
-            if ($item->getSku() === self::SKU_X) {
+            if ($rule->getConditions()->validate($item)) {
                 $xQty += (int)$item->getQty();
             }
         }
 
-        // 2. Find any Y item already managed by this promotion.
+        // Y is the product the merchandiser specified in free_gift_sku.
+        // We also track rule_id on the quote item so multiple simultaneous
+        // promotions can each manage their own free-gift line independently.
+        $freeGiftSku = $rule->getData('free_gift_sku');
+
         $yItem = null;
         foreach ($quote->getAllVisibleItems() as $item) {
-            if ($item->getSku() === self::SKU_Y
+            $ruleOpt = $item->getOptionByCode('free_gift_rule_id');
+            if ($item->getSku() === $freeGiftSku
                 && $item->getOptionByCode('is_free_gift')
+                && $ruleOpt
+                && (int)$ruleOpt->getValue() === (int)$rule->getId()
             ) {
                 $yItem = $item;
                 break;
             }
         }
 
-        // 3. If X was removed entirely, remove the free Y too.
         if ($xQty === 0) {
             if ($yItem) {
                 $quote->removeItem($yItem->getId());
@@ -264,59 +310,47 @@ class AutoAddFreeGift implements ObserverInterface
             return;
         }
 
-        // 4. Strict 1:1 ratio – required Y qty always equals X qty.
-        $requiredYQty = $xQty;
+        $requiredYQty = $xQty; // strict 1:1
 
         if ($yItem) {
-            // Update the existing free-gift item to the new qty.
             $yItem->setQty($requiredYQty);
         } else {
-            // Auto-add Y and lock it so the customer cannot remove it manually.
-            // Removal is handled by the sales_quote_remove_item observer, which
-            // decrements X by the same amount to keep the ratio honest.
-            $product = $this->productRepository->get(self::SKU_Y);
+            $product = $this->productRepository->get($freeGiftSku);
             $yItem   = $quote->addProduct($product, $requiredYQty);
-            $yItem->addOption(['code' => 'is_free_gift', 'value' => '1']);
+            // Lock Y so the customer cannot remove it manually.
+            // The sales_quote_remove_item observer decrements X by the same
+            // amount when a locked Y is removed to keep the ratio honest.
+            $yItem->addOption(['code' => 'is_free_gift',      'value' => '1']);
+            $yItem->addOption(['code' => 'free_gift_rule_id', 'value' => (string)$rule->getId()]);
         }
-
-        // 5. Mark the quote for totals recollection on the next page load.
-        //    The Cart Price Rule in the discount collector will apply the
-        //    100 % discount to the Y items during collectTotals().
-        $quote->setTriggerRecollect(1)->save();
     }
 }
 ```
 
 #### Step 5 – Before-plugin: enforce ratio integrity at order placement
 
-A customer can manipulate the cart between page loads (e.g. via direct POST or
-a browser devtools edit). The before-plugin on `QuoteManagement::placeOrder()`
-re-validates the X:Y ratio as the final gate before the order is written to the
-database.
-
 ```php
 namespace Tactacam\CartPromotion\Plugin;
 
 use Magento\Quote\Api\CartRepositoryInterface;
 use Magento\Quote\Model\QuoteManagement;
+use Magento\SalesRule\Model\ResourceModel\Rule\CollectionFactory as RuleCollectionFactory;
+use Magento\Store\Model\StoreManagerInterface;
 
 class EnforceGiftRatio
 {
-    private const SKU_X = 'product-x-sku';
-    private const SKU_Y = 'product-y-sku';
-
     public function __construct(
-        private readonly CartRepositoryInterface $cartRepository
+        private readonly CartRepositoryInterface $cartRepository,
+        private readonly RuleCollectionFactory $ruleCollectionFactory,
+        private readonly StoreManagerInterface $storeManager
     ) {}
 
     /**
      * Before placeOrder fires AFTER collectTotals but BEFORE the order rows
-     * are written. If Y qty exceeds X qty (cart manipulation) the excess Y
-     * items are silently trimmed so the order is always placed with a valid
-     * 1:1 ratio.
-     *
-     * Returning the (possibly modified) arguments re-enters the normal
-     * placeOrder flow with no visible disruption to the customer.
+     * are written. For each active buy_x_get_y rule the plugin re-counts X
+     * using the same rule Conditions evaluation as the observer, then caps
+     * the free-gift Y qty at that value in case the cart was manipulated
+     * between page loads.
      */
     public function beforePlaceOrder(
         QuoteManagement $subject,
@@ -325,37 +359,50 @@ class EnforceGiftRatio
     ): array {
         $quote = $this->cartRepository->get($cartId);
 
-        $xQty   = 0;
-        $yItems = [];
+        $rules = $this->ruleCollectionFactory->create()
+            ->addWebsiteGroupDateFilter(
+                $this->storeManager->getStore()->getWebsiteId(),
+                $quote->getCustomerGroupId()
+            )
+            ->addFieldToFilter('simple_action', 'buy_x_get_y')
+            ->addFieldToFilter('free_gift_sku', ['notnull' => true]);
 
-        foreach ($quote->getAllVisibleItems() as $item) {
-            if ($item->getSku() === self::SKU_X) {
-                $xQty += (int)$item->getQty();
+        foreach ($rules as $rule) {
+            // Re-evaluate X qty from rule Conditions – same logic as the observer.
+            $xQty = 0;
+            foreach ($quote->getAllVisibleItems() as $item) {
+                if ($rule->getConditions()->validate($item)) {
+                    $xQty += (int)$item->getQty();
+                }
             }
-            if ($item->getSku() === self::SKU_Y
-                && $item->getOptionByCode('is_free_gift')
-            ) {
-                $yItems[] = $item;
-            }
-        }
 
-        // Walk the free-gift items and cap their total qty at xQty.
-        $allowedYQty = $xQty;
-        foreach ($yItems as $yItem) {
-            $itemQty = (int)$yItem->getQty();
-            if ($allowedYQty <= 0) {
-                $quote->removeItem($yItem->getId());
-            } elseif ($itemQty > $allowedYQty) {
-                $yItem->setQty($allowedYQty);
-                $allowedYQty = 0;
-            } else {
-                $allowedYQty -= $itemQty;
+            $freeGiftSku = $rule->getData('free_gift_sku');
+            $allowedYQty = $xQty;
+
+            foreach ($quote->getAllVisibleItems() as $item) {
+                $ruleOpt = $item->getOptionByCode('free_gift_rule_id');
+                if ($item->getSku() !== $freeGiftSku
+                    || !$item->getOptionByCode('is_free_gift')
+                    || !$ruleOpt
+                    || (int)$ruleOpt->getValue() !== (int)$rule->getId()
+                ) {
+                    continue;
+                }
+
+                $itemQty = (int)$item->getQty();
+                if ($allowedYQty <= 0) {
+                    $quote->removeItem($item->getId());
+                } elseif ($itemQty > $allowedYQty) {
+                    $item->setQty($allowedYQty);
+                    $allowedYQty = 0;
+                } else {
+                    $allowedYQty -= $itemQty;
+                }
             }
         }
 
         $this->cartRepository->save($quote);
 
-        // Return all original arguments unchanged so placeOrder proceeds normally.
         return [$cartId, $paymentMethod];
     }
 }
@@ -366,7 +413,10 @@ class EnforceGiftRatio
 ```
 Does the promotion require auto-adding Y to the cart?
   No  → Native Cart Price Rule (buy_x_get_y, step=1, amount=1, max=0)
-  Yes → Native rule for pricing  +  observer to manage Y qty  +  before-plugin on placeOrder
+  Yes → Add free_gift_sku attribute to salesrule table
+        + Native rule for pricing
+        + AutoAddFreeGift observer (reads Conditions for X, free_gift_sku for Y)
+        + EnforceGiftRatio before-plugin on placeOrder
 ```
 
 ---
