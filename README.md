@@ -64,6 +64,23 @@ Both plugins are gated behind an admin toggle
 respect per-website/per-store scope, so the fix can be disabled in staging
 without affecting production.
 
+### Summary
+
+The ERP connector reads the customer's live address book via the Magento 1
+pattern `$order->getCustomer()->getDefaultShippingAddress()` rather than the
+order's own `sales_order_address` snapshot, causing a divergence whenever a
+customer updates their address after placing an order. Because `getCustomer()`
+is a magic `@method` docblock on `Order` — not a real PHP method — a standard
+`afterGetCustomer` plugin is silently ignored by the interceptor generator; the
+correct interception point is `afterGetData` guarded on `$key === 'customer'`,
+which is the real method the magic call resolves to at runtime. Two plugins
+cover both the direct model path and the repository/REST API path, overriding
+the customer's default shipping address in memory with the order snapshot on
+every call, with no database write and no change to the ERP connector. An admin
+toggle scoped per store allows the fix to be disabled in staging, and a CLI
+diagnostic command (`bin/magento tactacam:order:diagnose`) provides a
+field-by-field comparison of the two address sources for any order.
+
 ### Key technical note — why `afterGetData` not `afterGetCustomer`
 
 `getCustomer()` is declared only as a `@method` docblock on `Order`. It is not
@@ -125,18 +142,20 @@ on. Y must never exceed the quantity of X in the cart.
 
 ### Summary
 
-When X and Y are already in the cart, Magento's native `buy_x_get_y` Cart Price 
-Rule handles strict 1:1 with no custom code — `Discount Amount = 1`, 
-`Discount Qty Step = 1`, and `Maximum Qty = 0` scales the discount proportionally 
-with quantity. Where Y must be auto-added, a custom `free_gift_sku` attribute is 
-added to the `salesrule` table so the merchandiser specifies the gift product 
-directly on the rule in the admin, keeping all promotion configuration in one place. 
-An observer on `checkout_cart_product_add_after` reads the rule's Conditions to count 
-X items and auto-adds or adjusts Y accordingly, while the Cart Price Rule continues 
-to own all discount pricing through the native totals collector pipeline. 
-A before-plugin on `QuoteManagement::placeOrder()` acts as a final integrity gate, 
-re-evaluating the same Conditions immediately before the order is written to ensure 
-any client-side cart manipulation cannot result in more free items than purchased items.
+When X and Y are already in the cart, Magento's native `buy_x_get_y` Cart
+Price Rule handles strict 1:1 with no custom code — `Discount Amount = 1`,
+`Discount Qty Step = 1`, and `Maximum Qty = 0` scales the discount
+proportionally with quantity. Where Y must be auto-added, a custom
+`free_gift_sku` attribute is added to the `salesrule` table so the merchandiser
+specifies the gift product directly on the rule in the admin, keeping all
+promotion configuration in one place. An observer on
+`checkout_cart_product_add_after` reads the rule's Conditions to count X items
+and auto-adds or adjusts Y accordingly, while the Cart Price Rule continues to
+own all discount pricing through the native totals collector pipeline. A
+before-plugin on `QuoteManagement::placeOrder()` acts as a final integrity
+gate, re-evaluating the same Conditions immediately before the order is written
+to ensure any client-side cart manipulation cannot result in more free items
+than purchased items.
 
 ### Approach
 
@@ -436,90 +455,186 @@ Does the promotion require auto-adding Y to the cart?
 
 A simple product must display one set of images on the Magento storefront PDP
 and expose a *different* set of images through the REST/GraphQL API, which a
-mobile app uses as its image source.
+mobile app uses as its image source. Multiple API consumers may exist — mobile
+app, affiliate site requiring watermarked images, etc. — each needing their own
+optimised image files.
+
+### Summary
+
+The key insight is that the API response **structure** must stay identical across
+all consumers — the same `base`, `small_image`, and `thumbnail` role names —
+but the actual image files returned must differ by consumer. A convention of
+consumer-prefixed image roles (`mobile_base`, `affiliate_base`, etc.) registered
+in `view.xml` lets merchants assign consumer-specific image variants in the
+standard gallery admin UI with no new attributes or UI widgets. A plugin on
+`ProductRepositoryInterface` reads an `X-Consumer-Type` request header, maps it
+to the appropriate role prefix, and rewrites `media_gallery_entries` in place so
+the consuming app always receives standard role names carrying the correct images.
+The web PDP never sends the header and always receives the default gallery
+untouched; new consumer types are added by registering new roles in `view.xml`
+and configuring the mapping, with no further code changes required.
 
 ### Approach
 
-The guiding principle is to keep both image sets inside the native Magento media
-gallery pipeline so that all existing tooling (image resizing, CDN flushing,
-import/export) works without modification.
+The response contract is fixed — `base`, `small_image`, `thumbnail` must always
+be present with those names. What changes per consumer is which image file backs
+each role.
 
-#### Step 1 – Add a custom image role
+#### Step 1 – Register consumer-specific image roles in `view.xml`
 
-Magento supports custom image roles through
-`view.xml` (`media/images/image[@id]`). Add a new role, for example `app_image`,
-to the theme's `view.xml`:
+For each consumer type that needs its own image set, register a role per
+standard role using a `{consumer}_{role}` naming convention:
 
 ```xml
-<!-- Magento_Catalog view.xml -->
-<image id="app_image" type="image">
-    <width>1200</width>
-    <height>1200</height>
-</image>
+<!-- theme/Magento_Catalog/view.xml -->
+
+<!-- Web (default) – existing roles, no change needed -->
+
+<!-- Mobile app – smaller, compressed images -->
+<image id="mobile_base"        type="image"><width>800</width><height>800</height></image>
+<image id="mobile_small_image" type="image"><width>400</width><height>400</height></image>
+<image id="mobile_thumbnail"   type="image"><width>200</width><height>200</height></image>
+
+<!-- Affiliate – full resolution with watermark baked in at upload time -->
+<image id="affiliate_base"        type="image"><width>1200</width><height>1200</height></image>
+<image id="affiliate_small_image" type="image"><width>600</width><height>600</height></image>
+<image id="affiliate_thumbnail"   type="image"><width>300</width><height>300</height></image>
 ```
 
-Merchants assign images to this role via the product admin gallery — the same UI
-they already use for `base`, `small_image`, and `thumbnail`. No new attribute is
-needed; roles are stored as a flag on the existing `catalog_product_entity_media_gallery_value` row.
+Registering the roles in `view.xml` adds them to the product admin gallery UI,
+so merchants assign images to them exactly as they would `base` or `thumbnail`.
+Role assignments are stored in `catalog_product_entity_media_gallery_value.types`
+and read at runtime via `$entry->getTypes()`. No new attributes, no new tables.
 
-#### Step 2 – Plugin on the Product REST/GraphQL API to swap the gallery
+#### Step 2 – Consumer identification via request header
 
-A plugin on `Magento\Catalog\Api\ProductRepositoryInterface::get()` (and
-`getList()`) intercepts the API response and replaces `media_gallery_entries`
-with only the entries assigned to the `app_image` role, falling back to the full
-gallery if no `app_image` entries are found.
+API consumers identify themselves with a custom HTTP request header:
+
+```
+X-Consumer-Type: mobile
+X-Consumer-Type: affiliate
+```
+
+A header is preferable to a query parameter because it separates consumer context
+from resource addressing, keeps URLs cacheable and consistent, and is trivially
+added to any HTTP client or SDK. The web storefront never sends the header, so it
+always receives the default gallery.
+
+#### Step 3 – Plugin: remap `media_gallery_entries` per consumer
+
+A plugin on `ProductRepositoryInterface::get()` and `getList()` reads the header
+and rewrites `media_gallery_entries` so the response always uses standard role
+names but carries the consumer-specific image files. If no consumer-specific
+image has been assigned for a given role the plugin falls back to the standard
+role entry, guaranteeing the consumer always receives a complete set of images.
 
 ```php
-public function afterGet(
-    ProductRepositoryInterface $subject,
-    ProductInterface $result
-): ProductInterface {
-    // Only substitute when request comes from the API area
-    if ($this->state->getAreaCode() !== Area::AREA_WEBAPI_REST) {
-        return $result;
+namespace Tactacam\Catalog\Plugin;
+
+use Magento\Catalog\Api\Data\ProductInterface;
+use Magento\Catalog\Api\ProductRepositoryInterface;
+use Magento\Framework\App\RequestInterface;
+
+class ConsumerImagePlugin
+{
+    // Map each consumer type to its role prefix.
+    // New consumers are added here and in view.xml only.
+    private const CONSUMER_ROLE_PREFIX = [
+        'mobile'    => 'mobile_',
+        'affiliate' => 'affiliate_',
+    ];
+
+    private const STANDARD_ROLES = ['base', 'small_image', 'thumbnail'];
+
+    public function __construct(
+        private readonly RequestInterface $request
+    ) {}
+
+    public function afterGet(
+        ProductRepositoryInterface $subject,
+        ProductInterface $result
+    ): ProductInterface {
+        return $this->remapGallery($result);
     }
 
-    $apiEntries = array_values(array_filter(
-        $result->getMediaGalleryEntries() ?? [],
-        fn($e) => in_array('app_image', $e->getTypes(), true)
-    ));
-
-    if (!empty($apiEntries)) {
-        $result->setMediaGalleryEntries($apiEntries);
+    public function afterGetById(
+        ProductRepositoryInterface $subject,
+        ProductInterface $result
+    ): ProductInterface {
+        return $this->remapGallery($result);
     }
 
-    return $result;
+    private function remapGallery(ProductInterface $product): ProductInterface
+    {
+        $consumerType = $this->request->getHeader('X-Consumer-Type');
+
+        // No header or unknown consumer – return default gallery untouched.
+        if (!$consumerType || !isset(self::CONSUMER_ROLE_PREFIX[$consumerType])) {
+            return $product;
+        }
+
+        $prefix  = self::CONSUMER_ROLE_PREFIX[$consumerType];
+        $entries = $product->getMediaGalleryEntries() ?? [];
+
+        // Build a lookup of all entries indexed by their assigned roles.
+        $byRole = [];
+        foreach ($entries as $entry) {
+            foreach ($entry->getTypes() as $role) {
+                $byRole[$role] = $entry;
+            }
+        }
+
+        // For each standard role, substitute the consumer-specific entry.
+        // Falls back to the standard entry if no consumer variant is assigned.
+        $remapped = [];
+        foreach (self::STANDARD_ROLES as $standardRole) {
+            $consumerRole = $prefix . $standardRole;
+
+            if (isset($byRole[$consumerRole])) {
+                // Clone the entry and set the standard role name so the consuming
+                // app sees an identical response structure regardless of consumer type.
+                $entry = clone $byRole[$consumerRole];
+                $entry->setTypes([$standardRole]);
+                $remapped[] = $entry;
+            } elseif (isset($byRole[$standardRole])) {
+                $remapped[] = $byRole[$standardRole]; // fallback
+            }
+        }
+
+        if (!empty($remapped)) {
+            $product->setMediaGalleryEntries($remapped);
+        }
+
+        return $product;
+    }
 }
 ```
 
-Because the plugin runs in the `webapi_rest` area only, the storefront PDP
-request — which goes through `frontend` or `graphql` area — is completely
-unaffected and continues to display the full gallery.
+#### Step 4 – Fallback strategy
 
-For GraphQL the same logic is applied via a plugin on
-`Magento\CatalogGraphQl\Model\Resolver\Products\DataProvider\Product`.
+| Scenario | `base` returned | `small_image` returned | `thumbnail` returned |
+|---|---|---|---|
+| No `X-Consumer-Type` header | Standard `base` | Standard `small_image` | Standard `thumbnail` |
+| `X-Consumer-Type: mobile`, all mobile roles assigned | `mobile_base` file | `mobile_small_image` file | `mobile_thumbnail` file |
+| `X-Consumer-Type: mobile`, `mobile_thumbnail` missing | `mobile_base` file | `mobile_small_image` file | Standard `thumbnail` (fallback) |
+| Storefront PDP | Standard gallery — plugin never fires | | |
 
-#### Step 3 – Fallback strategy
-
-| Scenario | Result |
-|---|---|
-| Product has `app_image` entries | API returns only `app_image` entries |
-| Product has no `app_image` entries | API falls back to the full gallery |
-| Storefront PDP (any scenario) | Always shows the full gallery — plugin never fires |
-
-#### Step 4 – Merchant workflow
+#### Step 5 – Merchant workflow
 
 1. Open the product in the admin.
-2. Upload or select images in the **Images and Videos** tab.
-3. For images intended for the app, click the image and assign the **App Image** role.
-4. Images without that role are shown on the PDP only.
-5. No additional UI, attribute, or code changes are required per product.
+2. Upload the web-optimised images and assign `base`, `small_image`, `thumbnail`.
+3. Upload mobile-optimised images and assign `mobile_base`, `mobile_small_image`,
+   `mobile_thumbnail`.
+4. Upload watermarked images and assign `affiliate_base`, `affiliate_small_image`,
+   `affiliate_thumbnail`.
+5. Any standard role without a consumer-specific counterpart falls back
+   automatically — partial assignment is always safe.
 
-#### Why not a separate attribute?
+#### Step 6 – Adding a new consumer
 
-A separate media attribute (e.g. `api_gallery`) is a common alternative but it
-duplicates the storage backend, breaks the native image-resizing and CDN
-pipelines, requires a custom admin UI widget, and makes import/export more
-complex. The image-role approach reuses all of that infrastructure with only a
-plugin and a `view.xml` entry.
+1. Register `{consumer}_base`, `{consumer}_small_image`, `{consumer}_thumbnail`
+   in `view.xml`.
+2. Add the consumer key and prefix to `CONSUMER_ROLE_PREFIX` in the plugin.
+3. No other code changes required. Merchants begin assigning images to the new
+   roles immediately.
 
